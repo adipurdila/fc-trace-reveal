@@ -18,7 +18,7 @@ import {
   type AnimationPlaybackControls,
 } from "framer-motion"
 
-type FillType = "solid" | "gradient" | "animated-gradient"
+type FillType = "solid" | "gradient" | "animated-gradient" | "cutout"
 type TouchBehavior = "drag" | "sweep" | "static"
 type TextAlign = "left" | "center" | "right"
 type TextFit = "wrap" | "fill-width"
@@ -52,6 +52,7 @@ interface FillGroup {
   fillGradientEnd: string
   gradientAngle: number
   gradientSpeed: number
+  backdropColor: string
 }
 
 interface RevealGroup {
@@ -87,6 +88,91 @@ const parsePadding = (value: string) => {
     .map((part) => parseFloat(part) || 0)
   const [top = 0, right = top, bottom = top, left = right] = parts
   return { top, right, bottom, left }
+}
+
+// Pure rect math, no DOM writes — cheap enough to run on every window pointermove. Used to
+// treat the padded zone around the component as part of the hit area without any element
+// actually occupying that space (so it can't be clipped by an ancestor's overflow: clip).
+type EdgeInsets = { top: number; right: number; bottom: number; left: number }
+const isPointInExpandedRect = (
+  rect: DOMRect,
+  padding: EdgeInsets,
+  x: number,
+  y: number
+) =>
+  x >= rect.left - padding.left &&
+  x <= rect.right + padding.right &&
+  y >= rect.top - padding.top &&
+  y <= rect.bottom + padding.bottom
+
+// Canvas 2D has no native letter-spacing, so runs are measured/drawn one character at a
+// time, advancing by each glyph's own width plus the spacing. Approximates CSS
+// letter-spacing (which technically also adds trailing space after the last character);
+// close enough for mask-shape purposes.
+const measureRunWidth = (ctx: CanvasRenderingContext2D, run: string, letterSpacing: number) => {
+  if (!run) return 0
+  let width = 0
+  for (const char of run) width += ctx.measureText(char).width + letterSpacing
+  return width
+}
+
+const fillRunWithSpacing = (
+  ctx: CanvasRenderingContext2D,
+  run: string,
+  x: number,
+  y: number,
+  letterSpacing: number
+) => {
+  let cursor = x
+  for (const char of run) {
+    ctx.fillText(char, cursor, y)
+    cursor += ctx.measureText(char).width + letterSpacing
+  }
+}
+
+// Same per-character advance as fillRunWithSpacing, but strokes instead of fills — used
+// with globalCompositeOperation "destination-out" to inset the ink shape (see the ink-
+// shape inset comment where this is called).
+const strokeRunWithSpacing = (
+  ctx: CanvasRenderingContext2D,
+  run: string,
+  x: number,
+  y: number,
+  letterSpacing: number
+) => {
+  let cursor = x
+  for (const char of run) {
+    ctx.strokeText(char, cursor, y)
+    cursor += ctx.measureText(char).width + letterSpacing
+  }
+}
+
+// Manual word-wrap approximating CSS white-space:pre-wrap + overflow-wrap:break-word —
+// respects existing line breaks in the source text, then greedily wraps by word within
+// maxWidth. Not guaranteed to match the browser's own line-breaking in every edge case
+// (unusual scripts, kerning), but close for the common case of plain wrapped text.
+const wrapCanvasText = (
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  letterSpacing: number
+) => {
+  const lines: string[] = []
+  for (const paragraph of text.split("\n")) {
+    const words = paragraph.split(" ")
+    let currentLine = ""
+    for (const word of words) {
+      const candidate = currentLine ? `${currentLine} ${word}` : word
+      if (currentLine && measureRunWidth(ctx, candidate, letterSpacing) > maxWidth) {
+        lines.push(currentLine)
+        currentLine = word
+      } else {
+        currentLine = candidate
+      }
+    }
+    lines.push(currentLine)
+  }
+  return lines
 }
 
 const IDLE_DELAY_MS = 3000
@@ -134,6 +220,7 @@ export default function TraceReveal(props: TraceRevealProps) {
     fillGradientEnd = "#4ECDC4",
     gradientAngle = 45,
     gradientSpeed = 1,
+    backdropColor = "#FFFFFF",
   } = fill
 
   const {
@@ -148,17 +235,28 @@ export default function TraceReveal(props: TraceRevealProps) {
     padding = "80px 40px 80px 40px",
   } = interaction
 
-  // The hit area is expanded beyond the text by this much on each side via a separate
-  // absolutely-positioned overlay (see hitAreaStyle below) — never via padding/margin on
-  // the text's own box, so the text's layout, size, and position stay exactly as-is.
+  // The hit area is expanded beyond the text by this much on each side — computed purely
+  // as numbers (see the window-level pointer effect below), not as a DOM element sized via
+  // negative insets. That approach broke entirely whenever an ancestor (e.g. a Framer frame
+  // with overflow: clip and no spare room) clipped the oversized element before it could
+  // ever receive events — a real scenario for a component nested in someone else's layout,
+  // not just an edge case. A window-level listener with a manual bounds check has no DOM
+  // footprint to clip, so it works regardless of ancestor overflow.
   const hitAreaPadding = useMemo(() => parsePadding(padding), [padding])
 
   const isCanvas = RenderTarget.current() === RenderTarget.canvas
 
   const containerRef = useRef<HTMLDivElement>(null)
-  const hitAreaRef = useRef<HTMLDivElement>(null)
   const baseTextRef = useRef<HTMLDivElement>(null)
   const isInView = useInView(containerRef, { amount: 0.4, once: false })
+
+  // Cutout mode's backdrop is a directly-drawn <canvas>, not a CSS mask (see the redraw
+  // functions further below) — visible canvas, a cached glyph-shape bitmap (redrawn only
+  // when the text/font/layout actually changes, not per animation frame), and a reusable
+  // per-redraw scratch canvas to avoid allocating a new one every frame.
+  const backdropCanvasRef = useRef<HTMLCanvasElement>(null)
+  const glyphBitmapCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const scratchCanvasRef = useRef<HTMLCanvasElement | null>(null)
 
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
   const [fillWidthMetrics, setFillWidthMetrics] = useState({ scale: 1, height: 0 })
@@ -185,6 +283,11 @@ export default function TraceReveal(props: TraceRevealProps) {
   const springY = useSpring(rawY, springConfig)
 
   const bgPosition = useMotionValue(0)
+
+  // Cutout mode only: the transparent hole's own radius, grown/shrunk on enter/leave
+  // (independent of the position spring above) so it animates in as a spatial reveal
+  // rather than a flat fade — the same grow/shrink treatment the circle itself gets.
+  const holeRadius = useMotionValue(0)
 
   // Detect touch/coarse-pointer devices once on mount (guards window for SSR/canvas safety).
   useEffect(() => {
@@ -241,48 +344,52 @@ export default function TraceReveal(props: TraceRevealProps) {
 
   const staticTouchFill = touchBehavior === "static" && isTouchDevice
 
-  // Pointer listeners live on the expanded hit-area overlay (not window, so multiple
-  // instances on a page never steal each other's input), but coordinates are measured
-  // against the text's own (unpadded) box, since that's the coordinate space the mask
-  // and text layers actually render in.
+  // Listens on window rather than a padded DOM overlay: the padded zone is expanded purely
+  // by number, in isPointInExpandedRect, against the container's own real (unpadded)
+  // getBoundingClientRect(). That rect is nothing more than the component's actual box, so
+  // there's no oversized element for an ancestor's overflow: clip to cut off. Coordinates
+  // are still measured relative to that same real box, since that's the coordinate space
+  // the mask and text layers render in.
   useEffect(() => {
-    const hitEl = hitAreaRef.current
     const textEl = containerRef.current
-    if (!hitEl || !textEl || staticTouchFill) return
+    if (!textEl || staticTouchFill) return
 
-    const updateFromPoint = (clientX: number, clientY: number) => {
+    const processPoint = (clientX: number, clientY: number) => {
       const rect = textEl.getBoundingClientRect()
+      if (!isPointInExpandedRect(rect, hitAreaPadding, clientX, clientY)) {
+        setIsRevealActive(false)
+        return
+      }
       hasInteractedRef.current = true
       rawX.set(clientX - rect.left)
       rawY.set(clientY - rect.top)
-    }
-
-    const handlePointerMove = (event: PointerEvent) => {
-      updateFromPoint(event.clientX, event.clientY)
       setIsRevealActive(true)
     }
+
+    const handlePointerMove = (event: PointerEvent) => processPoint(event.clientX, event.clientY)
+    const handlePointerDown = (event: PointerEvent) => processPoint(event.clientX, event.clientY)
     const handlePointerLeave = () => setIsRevealActive(false)
-    const handlePointerDown = (event: PointerEvent) => {
-      updateFromPoint(event.clientX, event.clientY)
-      setIsRevealActive(true)
-    }
+    const handlePointerCancel = () => setIsRevealActive(false)
 
-    hitEl.addEventListener("pointermove", handlePointerMove)
-    hitEl.addEventListener("pointerdown", handlePointerDown)
-    hitEl.addEventListener("pointerleave", handlePointerLeave)
-    hitEl.addEventListener("pointercancel", handlePointerLeave)
+    window.addEventListener("pointermove", handlePointerMove)
+    window.addEventListener("pointerdown", handlePointerDown)
+    window.addEventListener("pointerleave", handlePointerLeave)
+    window.addEventListener("pointercancel", handlePointerCancel)
     return () => {
-      hitEl.removeEventListener("pointermove", handlePointerMove)
-      hitEl.removeEventListener("pointerdown", handlePointerDown)
-      hitEl.removeEventListener("pointerleave", handlePointerLeave)
-      hitEl.removeEventListener("pointercancel", handlePointerLeave)
+      window.removeEventListener("pointermove", handlePointerMove)
+      window.removeEventListener("pointerdown", handlePointerDown)
+      window.removeEventListener("pointerleave", handlePointerLeave)
+      window.removeEventListener("pointercancel", handlePointerCancel)
     }
-  }, [rawX, rawY, staticTouchFill])
+  }, [rawX, rawY, staticTouchFill, hitAreaPadding])
 
   // Idle drift: only outside the canvas editor, only after a pause in real input.
   useEffect(() => {
     if (!idleAnimation || isCanvas || staticTouchFill) return
     if (!dimensions.width || !dimensions.height) return
+
+    const textEl = containerRef.current
+    if (!textEl) return
 
     let xControls: AnimationPlaybackControls | undefined
     let yControls: AnimationPlaybackControls | undefined
@@ -307,23 +414,24 @@ export default function TraceReveal(props: TraceRevealProps) {
       window.clearTimeout(idleTimeout)
       idleTimeout = window.setTimeout(startIdle, IDLE_DELAY_MS)
     }
-    const handleActivity = () => {
+    const handleActivity = (event: PointerEvent) => {
+      const rect = textEl.getBoundingClientRect()
+      if (!isPointInExpandedRect(rect, hitAreaPadding, event.clientX, event.clientY)) return
       stopIdle()
       scheduleIdle()
     }
 
-    const el = hitAreaRef.current
-    el?.addEventListener("pointermove", handleActivity)
-    el?.addEventListener("pointerdown", handleActivity)
+    window.addEventListener("pointermove", handleActivity)
+    window.addEventListener("pointerdown", handleActivity)
     scheduleIdle()
 
     return () => {
       window.clearTimeout(idleTimeout)
       stopIdle()
-      el?.removeEventListener("pointermove", handleActivity)
-      el?.removeEventListener("pointerdown", handleActivity)
+      window.removeEventListener("pointermove", handleActivity)
+      window.removeEventListener("pointerdown", handleActivity)
     }
-  }, [idleAnimation, isCanvas, staticTouchFill, dimensions, rawX, rawY])
+  }, [idleAnimation, isCanvas, staticTouchFill, dimensions, rawX, rawY, hitAreaPadding])
 
   // Auto-sweep: a one-pass reveal each time the component enters view on touch.
   useEffect(() => {
@@ -351,6 +459,22 @@ export default function TraceReveal(props: TraceRevealProps) {
     return () => controls.stop()
   }, [fillType, gradientSpeed, isCanvas, bgPosition])
 
+  // Cutout mode: grow the hole in on enter, shrink it back out on leave. A short spring,
+  // no overshoot (so it never dips negative). Position still comes from springX/springY —
+  // this only drives size.
+  useEffect(() => {
+    if (fillType !== "cutout") {
+      holeRadius.set(0)
+      return
+    }
+    const controls = animate(holeRadius, isRevealActive ? radius : 0, {
+      type: "spring",
+      duration: 0.25,
+      bounce: 0,
+    })
+    return () => controls.stop()
+  }, [fillType, isRevealActive, radius, holeRadius])
+
   const backgroundPositionTemplate = useMotionTemplate`${bgPosition}% 50%`
 
   const revealVisible = staticTouchFill || isRevealActive
@@ -366,6 +490,234 @@ export default function TraceReveal(props: TraceRevealProps) {
   const maskImage = useMotionTemplate`radial-gradient(circle ${radius}px at ${springX}px ${springY}px, black 0%, black ${innerStopSafe}%, transparent 100%)`
 
   const isFillWidth = textFit === "fill-width"
+  const isCutout = fillType === "cutout"
+
+  // The backdrop's hole must be the INTERSECTION of the circle and the glyph ink — not the
+  // circle alone (leaks into the gaps between letters) and not a static copy of the glyph
+  // shape (never reaches the real background). After three attempts to get this right via
+  // CSS mask-composite/mask-mode ran into browser-specific SVG-luminance/CSS-alpha mask
+  // interop that couldn't be debugged without live inspection, this is computed directly
+  // with canvas 2D compositing instead — deterministic, no mask-mode/mask-type involved.
+  //
+  // redrawGlyphBitmap draws the glyph shapes (solid, any color — only alpha/shape matters)
+  // onto a cached, off-DOM canvas. It's async because it gates the first draw on the font
+  // actually being loaded: canvas 2D resolves fonts through a separate pipeline from CSS
+  // text layout, and drawing before a custom weight/family is ready silently substitutes a
+  // fallback font, producing a mask shape that doesn't match the real rendered letters (the
+  // same root cause behind an earlier, now-fixed bug in this file). This bitmap is cheap to
+  // reuse frame-to-frame since it only depends on text/font/layout, never cursor position.
+  const redrawGlyphBitmap = useCallback(async () => {
+    if (typeof document === "undefined" || !dimensions.width || !dimensions.height) return
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1
+    if (!glyphBitmapCanvasRef.current) {
+      glyphBitmapCanvasRef.current = document.createElement("canvas")
+    }
+    const canvas = glyphBitmapCanvasRef.current
+    canvas.width = Math.max(1, Math.round(dimensions.width * dpr))
+    canvas.height = Math.max(1, Math.round(dimensions.height * dpr))
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+
+    const weight = fontWeight ?? 400
+    const style = fontStyle ?? "normal"
+    const fontSpec = `${style} ${weight} ${fontSize}px ${fontFamily}`
+
+    if (typeof document.fonts?.load === "function") {
+      try {
+        await document.fonts.load(fontSpec, text || " ")
+        await document.fonts.ready
+      } catch {
+        // Best effort — still draw below even if preloading itself rejects.
+      }
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, dimensions.width, dimensions.height)
+    ctx.fillStyle = "black"
+    ctx.font = fontSpec
+    ctx.textBaseline = "alphabetic"
+
+    // Real, measured ascent/descent for this exact font/weight/size — NOT the specific
+    // text's ink bounds (that's actualBoundingBoxAscent/Descent, content-dependent and
+    // wrong for this purpose), but fontBoundingBoxAscent/Descent, which reflects the
+    // font's own design metrics the same way for any string. That's what CSS text layout
+    // actually uses to place the baseline within a line box, so it's what has to drive
+    // this too. A single measurement is reused for every line below, since these values
+    // don't depend on which characters are being measured, only the font/size in ctx.font.
+    const metrics = ctx.measureText(text || " ")
+    const fontAscent = metrics.fontBoundingBoxAscent ?? fontSize * 0.8
+    const fontDescent = metrics.fontBoundingBoxDescent ?? fontSize * 0.2
+
+    // Mirrors the real CSS baseline placement formula: within a line box of height
+    // lineHeightPx, the font's own (ascent + descent) sits centered, with the baseline
+    // offset from the line's top by that centering gap ("half-leading") plus the ascent.
+    const baselineOffset = (lineHeightPx: number) =>
+      (lineHeightPx - (fontAscent + fontDescent)) / 2 + fontAscent
+
+    // -webkit-text-stroke paints centered on the glyph outline — half its width bleeds
+    // outward (already outside this fill, nothing to adjust there) and half bleeds inward,
+    // into what this fill alone would otherwise treat as solid ink. Without correcting for
+    // that, the hole computed from this shape starts revealing half a stroke-width before
+    // the visible stroke actually ends, producing a visible double edge. Erasing a stroke
+    // of the FULL strokeWidth (not half), centered on the same outline via destination-out,
+    // only actually removes pixels on the side that overlaps existing fill — the outward
+    // half falls where there was never any ink to erase — so the net effect is exactly the
+    // strokeWidth/2 inward inset needed, without computing an offset path by hand.
+    const insetWidth = Math.max(0, strokeWidth)
+
+    if (isFillWidth) {
+      // Fill Width forces lineHeight:1 in the real rendered CSS (see sharedTextStyle), so
+      // its line box height is exactly fontSize.
+      ctx.save()
+      ctx.scale(fillWidthMetrics.scale, fillWidthMetrics.scale)
+      const y = baselineOffset(fontSize)
+      fillRunWithSpacing(ctx, text, 0, y, letterSpacing)
+      if (insetWidth > 0) {
+        ctx.globalCompositeOperation = "destination-out"
+        ctx.lineWidth = insetWidth
+        strokeRunWithSpacing(ctx, text, 0, y, letterSpacing)
+        ctx.globalCompositeOperation = "source-over"
+      }
+      ctx.restore()
+    } else {
+      const lines = wrapCanvasText(ctx, text, dimensions.width, letterSpacing)
+      const lineHeightPx = fontSize * lineHeight
+      const firstLineBaseline = baselineOffset(lineHeightPx)
+      const linePositions = lines.map((line, i) => {
+        const lineWidth = measureRunWidth(ctx, line, letterSpacing)
+        const x =
+          textAlign === "center"
+            ? (dimensions.width - lineWidth) / 2
+            : textAlign === "right"
+              ? dimensions.width - lineWidth
+              : 0
+        const y = lineHeightPx * i + firstLineBaseline
+        fillRunWithSpacing(ctx, line, x, y, letterSpacing)
+        return { line, x, y }
+      })
+      if (insetWidth > 0) {
+        ctx.globalCompositeOperation = "destination-out"
+        ctx.lineWidth = insetWidth
+        linePositions.forEach(({ line, x, y }) =>
+          strokeRunWithSpacing(ctx, line, x, y, letterSpacing)
+        )
+        ctx.globalCompositeOperation = "source-over"
+      }
+    }
+  }, [
+    dimensions.width,
+    dimensions.height,
+    text,
+    fontFamily,
+    fontWeight,
+    fontStyle,
+    fontSize,
+    letterSpacing,
+    lineHeight,
+    textAlign,
+    isFillWidth,
+    fillWidthMetrics.scale,
+    strokeWidth,
+  ])
+
+  // Runs every time the circle's position/size changes (see the motion-value subscriptions
+  // below) plus whenever the "slow" inputs (color, hardness, dimensions) change. Draws a
+  // solid backdropColor rect, then erases exactly ink ∩ circle from it: first compositing
+  // the cached glyph bitmap with the circle gradient via "source-in" on a scratch canvas
+  // (keeping only ink that falls inside the circle, feathered by Edge Hardness), then
+  // erasing that result from the main canvas via "destination-out". Two lightweight
+  // composites per frame — the expensive text draw only happens in redrawGlyphBitmap above.
+  const redrawBackdrop = useCallback(() => {
+    const canvas = backdropCanvasRef.current
+    const glyphCanvas = glyphBitmapCanvasRef.current
+    if (!canvas || !dimensions.width || !dimensions.height) return
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1
+    const targetW = Math.max(1, Math.round(dimensions.width * dpr))
+    const targetH = Math.max(1, Math.round(dimensions.height * dpr))
+    if (canvas.width !== targetW) canvas.width = targetW
+    if (canvas.height !== targetH) canvas.height = targetH
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.globalCompositeOperation = "source-over"
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    ctx.fillStyle = backdropColor
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+    // Static touch fill: fully opaque, no hole, matching the other layers' static behavior.
+    if (staticTouchFill || !glyphCanvas) return
+
+    if (!scratchCanvasRef.current) {
+      scratchCanvasRef.current = document.createElement("canvas")
+    }
+    const scratch = scratchCanvasRef.current
+    if (scratch.width !== canvas.width) scratch.width = canvas.width
+    if (scratch.height !== canvas.height) scratch.height = canvas.height
+    const sctx = scratch.getContext("2d")
+    if (!sctx) return
+
+    sctx.setTransform(1, 0, 0, 1, 0, 0)
+    sctx.globalCompositeOperation = "source-over"
+    sctx.clearRect(0, 0, scratch.width, scratch.height)
+    sctx.drawImage(glyphCanvas, 0, 0)
+
+    const cx = springX.get() * dpr
+    const cy = springY.get() * dpr
+    const r = Math.max(0.01, holeRadius.get() * dpr)
+    const hardnessStop = clamp01(innerStopSafe / 100)
+
+    sctx.globalCompositeOperation = "source-in"
+    const gradient = sctx.createRadialGradient(cx, cy, 0, cx, cy, r)
+    gradient.addColorStop(0, "black")
+    gradient.addColorStop(Math.min(0.999, hardnessStop), "black")
+    gradient.addColorStop(1, "rgba(0,0,0,0)")
+    sctx.fillStyle = gradient
+    sctx.fillRect(0, 0, scratch.width, scratch.height)
+
+    ctx.globalCompositeOperation = "destination-out"
+    ctx.drawImage(scratch, 0, 0)
+    ctx.globalCompositeOperation = "source-over"
+  }, [
+    dimensions.width,
+    dimensions.height,
+    backdropColor,
+    staticTouchFill,
+    innerStopSafe,
+    springX,
+    springY,
+    holeRadius,
+  ])
+
+  // Glyph bitmap only needs to change when text/font/layout change — not per animation
+  // frame — so it's driven by a normal effect, not the motion-value subscriptions below.
+  useEffect(() => {
+    if (!isCutout) return
+    let cancelled = false
+    redrawGlyphBitmap().then(() => {
+      if (!cancelled) redrawBackdrop()
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [isCutout, redrawGlyphBitmap, redrawBackdrop])
+
+  // Position/size change on (almost) every frame during interaction — subscribed directly
+  // to the motion values (imperative, no React re-render per frame) rather than a separate
+  // requestAnimationFrame loop, so the canvas stays in lockstep with the same spring system
+  // already driving the glyph-shaped fill layer's circle.
+  useEffect(() => {
+    if (!isCutout) return
+    redrawBackdrop()
+    const unsubX = springX.on("change", redrawBackdrop)
+    const unsubY = springY.on("change", redrawBackdrop)
+    const unsubR = holeRadius.on("change", redrawBackdrop)
+    return () => {
+      unsubX()
+      unsubY()
+      unsubR()
+    }
+  }, [isCutout, springX, springY, holeRadius, redrawBackdrop])
 
   // In Fill Width mode both layers get the identical transform (same scale, same
   // origin) so they stay pixel-aligned; inline-block makes scrollWidth reflect the
@@ -401,6 +753,8 @@ export default function TraceReveal(props: TraceRevealProps) {
     opacity: strokeOpacity,
   }
 
+  // Cutout has no branch here: its glyph-shaped fill layer isn't rendered at all (see
+  // below) — the canvas backdrop is now the sole source of the reveal's shape/boundary.
   const fillTextStyle: CSSProperties =
     fillType === "solid"
       ? { ...sharedTextStyle, color: fillColor }
@@ -410,9 +764,7 @@ export default function TraceReveal(props: TraceRevealProps) {
           backgroundImage: `linear-gradient(${gradientAngle}deg, ${fillGradientStart}, ${fillGradientEnd})`,
           backgroundClip: "text",
           WebkitBackgroundClip: "text",
-          ...(fillType === "animated-gradient"
-            ? { backgroundSize: "200% 200%" }
-            : {}),
+          ...(fillType === "animated-gradient" ? { backgroundSize: "200% 200%" } : {}),
         }
 
   // Explicit height in Fill Width mode: `transform: scale()` never affects layout, so
@@ -423,54 +775,72 @@ export default function TraceReveal(props: TraceRevealProps) {
     position: "relative",
     display: "block",
     width: "100%",
+    // Only covers the component's own (unpadded) box — a touch starting in the padding-only
+    // hit-area zone has no element under it to carry this, so it falls back to default touch
+    // scrolling there. That's the trade-off for a padded zone with no DOM footprint of its
+    // own to clip.
+    touchAction: touchBehavior === "drag" ? "none" : "auto",
     ...(isFillWidth && fillWidthMetrics.height > 0
       ? { height: `${fillWidthMetrics.height}px` }
       : {}),
     ...props.style,
   }
 
-  // Absolutely-positioned overlay, offset outward by the padding amounts. It doesn't
-  // contribute to rootStyle's own auto-sized box (absolute elements are out of flow),
-  // so the text's layout/size/position stay exactly as if padding were 0. Painted last
-  // so it sits above the text layers and can capture pointer events across its full area.
-  const hitAreaStyle: CSSProperties = {
-    position: "absolute",
-    top: -hitAreaPadding.top,
-    left: -hitAreaPadding.left,
-    right: -hitAreaPadding.right,
-    bottom: -hitAreaPadding.bottom,
-    touchAction: touchBehavior === "drag" ? "none" : "auto",
-  }
-
   return (
     <div ref={containerRef} style={rootStyle}>
+      {isCutout && (
+        /* Cutout only: a canvas painted imperatively by redrawBackdrop (see above) — opaque
+           backdropColor everywhere except the ink ∩ circle intersection, computed via canvas
+           compositing rather than CSS masking. No interactivity of its own; position/growth/
+           hardness come from the same motion values the glyph-shaped fill layer uses.
+           Negative z-index keeps this under the (non-positioned, so normally topmost-by-
+           default) stroke text below without touching that layer's own styling. */
+        <canvas
+          ref={backdropCanvasRef}
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: -1,
+            pointerEvents: "none",
+            width: "100%",
+            height: "100%",
+          }}
+        />
+      )}
+
       {/* Real, selectable, screen-reader-readable text node. */}
       <div ref={baseTextRef} style={baseTextStyle}>{text}</div>
 
-      {/* Decorative fill layer, clipped to the reveal circle. Never part of the a11y tree. */}
-      <motion.div
-        aria-hidden="true"
-        style={{
-          position: "absolute",
-          inset: 0,
-          pointerEvents: "none",
-          userSelect: "none",
-          opacity: revealVisible ? 1 : 0,
-          transition: "opacity 200ms ease",
-          WebkitMaskImage: staticTouchFill ? "none" : maskImage,
-          maskImage: staticTouchFill ? "none" : maskImage,
-          ...(fillType === "animated-gradient"
-            ? {
-                backgroundPositionX: backgroundPositionTemplate as unknown as string,
-              }
-            : {}),
-        }}
-      >
-        <div style={fillTextStyle}>{text}</div>
-      </motion.div>
-
-      {/* Invisible pointer-tracking overlay, expanded beyond the text by Padding. */}
-      <div ref={hitAreaRef} aria-hidden="true" style={hitAreaStyle} />
+      {/* Decorative fill layer, clipped to the reveal circle. Never part of the a11y tree.
+          Not rendered in Cutout mode at all — that mode's entire reveal (shape, boundary,
+          and resting appearance) comes from the canvas backdrop below, which is the sole
+          authority on where ink meets the circle. Having this layer separately compute
+          the same boundary via CSS masking of real DOM text produced a visible double
+          edge where its browser-rendered boundary didn't pixel-align with the canvas's
+          own text rendering — two independent systems disagreeing at the edge. */}
+      {!isCutout && (
+        <motion.div
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            inset: 0,
+            pointerEvents: "none",
+            userSelect: "none",
+            opacity: revealVisible ? 1 : 0,
+            transition: "opacity 200ms ease",
+            WebkitMaskImage: staticTouchFill ? "none" : maskImage,
+            maskImage: staticTouchFill ? "none" : maskImage,
+            ...(fillType === "animated-gradient"
+              ? {
+                  backgroundPositionX: backgroundPositionTemplate as unknown as string,
+                }
+              : {}),
+          }}
+        >
+          <div style={fillTextStyle}>{text}</div>
+        </motion.div>
+      )}
     </div>
   )
 }
@@ -575,8 +945,8 @@ addPropertyControls(TraceReveal, {
         type: ControlType.Enum,
         title: "Type",
         defaultValue: "solid",
-        options: ["solid", "gradient", "animated-gradient"],
-        optionTitles: ["Solid", "Gradient", "Animated Gradient"],
+        options: ["solid", "gradient", "animated-gradient", "cutout"],
+        optionTitles: ["Solid", "Gradient", "Animated Gradient", "Cutout (Reveal Background)"],
       },
       fillColor: {
         type: ControlType.Color,
@@ -588,13 +958,15 @@ addPropertyControls(TraceReveal, {
         type: ControlType.Color,
         title: "Gradient Start",
         defaultValue: "#FF6B6B",
-        hidden: (props: FillGroup) => props.fillType === "solid",
+        hidden: (props: FillGroup) =>
+          props.fillType !== "gradient" && props.fillType !== "animated-gradient",
       },
       fillGradientEnd: {
         type: ControlType.Color,
         title: "Gradient End",
         defaultValue: "#4ECDC4",
-        hidden: (props: FillGroup) => props.fillType === "solid",
+        hidden: (props: FillGroup) =>
+          props.fillType !== "gradient" && props.fillType !== "animated-gradient",
       },
       gradientAngle: {
         type: ControlType.Number,
@@ -604,7 +976,8 @@ addPropertyControls(TraceReveal, {
         max: 360,
         step: 1,
         unit: "deg",
-        hidden: (props: FillGroup) => props.fillType === "solid",
+        hidden: (props: FillGroup) =>
+          props.fillType !== "gradient" && props.fillType !== "animated-gradient",
       },
       gradientSpeed: {
         type: ControlType.Number,
@@ -614,6 +987,14 @@ addPropertyControls(TraceReveal, {
         max: 5,
         step: 0.1,
         hidden: (props: FillGroup) => props.fillType !== "animated-gradient",
+      },
+      backdropColor: {
+        type: ControlType.Color,
+        title: "Backdrop Color",
+        defaultValue: "#FFFFFF",
+        hidden: (props: FillGroup) => props.fillType !== "cutout",
+        description:
+          "Place a Framer Shader layer (or any layer) directly behind this component, and set Backdrop Color to match your page background.",
       },
     },
   },
