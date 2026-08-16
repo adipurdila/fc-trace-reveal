@@ -355,9 +355,15 @@ export default function TraceReveal(props: TraceRevealProps) {
 
   const revealVisible = staticTouchFill || isRevealActive
 
-  // hardness 0 = feathered gradient across the whole radius, 1 = near-hard edge.
-  const innerStopPercent = clamp01(edgeHardness) * 95
-  const maskImage = useMotionTemplate`radial-gradient(circle ${radius}px at ${springX}px ${springY}px, black 0%, black ${innerStopPercent}%, transparent 100%)`
+  // hardness 0 = feathered across the whole radius, 1 = crisp cutoff at the edge. Clamped
+  // a hair inside [0, 100] so the two "black" stops (and the black/transparent boundary at
+  // hardness 1) are never at the exact same position — some renderers mis-render truly
+  // coincident same-color stops instead of treating them as the well-defined no-op CSS
+  // intends, which otherwise let hardness 0 reveal unbounded instead of staying within the
+  // radius, and left a small residual feather at hardness 1 that should be fully crisp.
+  const innerStopPercent = clamp01(edgeHardness) * 100
+  const innerStopSafe = Math.min(Math.max(innerStopPercent, 0.1), 99.9)
+  const maskImage = useMotionTemplate`radial-gradient(circle ${radius}px at ${springX}px ${springY}px, black 0%, black ${innerStopSafe}%, transparent 100%)`
 
   const isFillWidth = textFit === "fill-width"
 
@@ -508,8 +514,8 @@ addPropertyControls(TraceReveal, {
         type: ControlType.Number,
         title: "Letter Spacing",
         defaultValue: 0,
-        min: -10,
-        max: 50,
+        min: -20,
+        max: 100,
         step: 0.1,
         unit: "px",
       },
