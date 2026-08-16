@@ -215,12 +215,17 @@ export default function TraceReveal(props: TraceRevealProps) {
     return () => observer.disconnect()
   }, [rawX, rawY])
 
-  // Fill Width mode: measure the text's natural (unscaled) single-line size — via
-  // scrollWidth/Height, which `transform` never affects regardless of any previously
-  // applied scale — then derive the uniform scale that makes it exactly fill the
-  // container's width. Runs in a layout effect so the corrected scale is applied
-  // before paint, avoiding a flash of the untransformed size. In "wrap" mode this
-  // resets to a no-op (scale 1, no explicit height), leaving that behavior untouched.
+  // Fill Width mode: measure the live text layer's natural (unscaled) width — scrollWidth
+  // is transform-invariant, so it's safe to read directly off the real, visible element
+  // regardless of whatever scale is currently applied to it. The wrapper's height is NOT
+  // measured at all: since we force lineHeight to "1" ourselves (see sharedTextStyle), the
+  // text's unscaled layout-box height is exactly `fontSize` by construction — scaling that
+  // by the same factor gives the wrapper's height an exact match to what the transformed
+  // text actually occupies, rather than an approximation of it (a previous version of this
+  // measured tight ink bounds instead, which undershot the real rendered line-box height
+  // and left Framer's own layout under-reserving space for the text). Runs in a layout
+  // effect so the corrected scale/height apply before paint, avoiding a flash of the
+  // untransformed size. In "wrap" mode this resets to a no-op, untouched.
   useLayoutEffect(() => {
     if (textFit !== "fill-width") {
       setFillWidthMetrics({ scale: 1, height: 0 })
@@ -229,21 +234,10 @@ export default function TraceReveal(props: TraceRevealProps) {
     const el = baseTextRef.current
     if (!el || !dimensions.width) return
     const naturalWidth = el.scrollWidth
-    const naturalHeight = el.scrollHeight
-    if (!naturalWidth || !naturalHeight) return
+    if (!naturalWidth) return
     const scale = dimensions.width / naturalWidth
-    setFillWidthMetrics({ scale, height: naturalHeight * scale })
-  }, [
-    textFit,
-    dimensions.width,
-    text,
-    fontSize,
-    letterSpacing,
-    lineHeight,
-    fontFamily,
-    fontWeight,
-    fontStyle,
-  ])
+    setFillWidthMetrics({ scale, height: fontSize * scale })
+  }, [textFit, dimensions.width, fontSize, text, letterSpacing, fontFamily, fontWeight, fontStyle])
 
   const staticTouchFill = touchBehavior === "static" && isTouchDevice
 
@@ -377,7 +371,11 @@ export default function TraceReveal(props: TraceRevealProps) {
     fontStyle,
     fontSize: `${fontSize}px`,
     letterSpacing: `${letterSpacing}px`,
-    lineHeight: `${lineHeight}`,
+    // Line-height only matters between lines; Fill Width is always a single line, so a
+    // simple tight constant is enough here — the wrapper's actual height comes from a
+    // real DOM ink measurement below, not from this value (see the fill-width layout
+    // effect and the hidden measurement clone further down).
+    lineHeight: isFillWidth ? "1" : `${lineHeight}`,
     textAlign,
     whiteSpace: isFillWidth ? "nowrap" : "pre-wrap",
     overflowWrap: "break-word",
@@ -482,6 +480,13 @@ addPropertyControls(TraceReveal, {
         defaultValue: "Hover to reveal",
         displayTextArea: true,
       },
+      textFit: {
+        type: ControlType.Enum,
+        title: "Text Fit",
+        defaultValue: "wrap",
+        options: ["wrap", "fill-width"],
+        optionTitles: ["Wrap (Fixed Size)", "Fill Width (Single Line)"],
+      },
       font: {
         type: ControlType.Font,
         title: "Font",
@@ -491,12 +496,13 @@ addPropertyControls(TraceReveal, {
       },
       fontSize: {
         type: ControlType.Number,
-        title: "Size",
+        title: "Font Size",
         defaultValue: 64,
         min: 8,
         max: 300,
         step: 1,
         unit: "px",
+        hidden: (props: ContentGroup) => props.textFit === "fill-width",
       },
       letterSpacing: {
         type: ControlType.Number,
@@ -511,9 +517,10 @@ addPropertyControls(TraceReveal, {
         type: ControlType.Number,
         title: "Line Height",
         defaultValue: 1.1,
-        min: 0.8,
+        min: 0.5,
         max: 3,
         step: 0.05,
+        hidden: (props: ContentGroup) => props.textFit === "fill-width",
       },
       textAlign: {
         type: ControlType.Enum,
@@ -522,13 +529,7 @@ addPropertyControls(TraceReveal, {
         options: ["left", "center", "right"],
         optionTitles: ["Left", "Center", "Right"],
         displaySegmentedControl: true,
-      },
-      textFit: {
-        type: ControlType.Enum,
-        title: "Text Fit",
-        defaultValue: "wrap",
-        options: ["wrap", "fill-width"],
-        optionTitles: ["Wrap (Fixed Size)", "Fill Width (Single Line)"],
+        hidden: (props: ContentGroup) => props.textFit === "fill-width",
       },
     },
   },
