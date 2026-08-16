@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -20,6 +21,7 @@ import {
 type FillType = "solid" | "gradient" | "animated-gradient"
 type TouchBehavior = "drag" | "sweep" | "static"
 type TextAlign = "left" | "center" | "right"
+type TextFit = "wrap" | "fill-width"
 
 interface FontValue {
   fontFamily?: string
@@ -34,6 +36,7 @@ interface ContentGroup {
   letterSpacing: number
   lineHeight: number
   textAlign: TextAlign
+  textFit: TextFit
 }
 
 interface StrokeGroup {
@@ -110,6 +113,7 @@ export default function TraceReveal(props: TraceRevealProps) {
     letterSpacing = 0,
     lineHeight = 1.1,
     textAlign = "center",
+    textFit = "wrap",
   } = content
   const {
     fontFamily = "Inter, sans-serif",
@@ -153,9 +157,11 @@ export default function TraceReveal(props: TraceRevealProps) {
 
   const containerRef = useRef<HTMLDivElement>(null)
   const hitAreaRef = useRef<HTMLDivElement>(null)
+  const baseTextRef = useRef<HTMLDivElement>(null)
   const isInView = useInView(containerRef, { amount: 0.4, once: false })
 
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
+  const [fillWidthMetrics, setFillWidthMetrics] = useState({ scale: 1, height: 0 })
   const [isRevealActive, setIsRevealActive] = useState(false)
   const [isTouchDevice, setIsTouchDevice] = useState(false)
 
@@ -208,6 +214,36 @@ export default function TraceReveal(props: TraceRevealProps) {
     observer.observe(el)
     return () => observer.disconnect()
   }, [rawX, rawY])
+
+  // Fill Width mode: measure the text's natural (unscaled) single-line size — via
+  // scrollWidth/Height, which `transform` never affects regardless of any previously
+  // applied scale — then derive the uniform scale that makes it exactly fill the
+  // container's width. Runs in a layout effect so the corrected scale is applied
+  // before paint, avoiding a flash of the untransformed size. In "wrap" mode this
+  // resets to a no-op (scale 1, no explicit height), leaving that behavior untouched.
+  useLayoutEffect(() => {
+    if (textFit !== "fill-width") {
+      setFillWidthMetrics({ scale: 1, height: 0 })
+      return
+    }
+    const el = baseTextRef.current
+    if (!el || !dimensions.width) return
+    const naturalWidth = el.scrollWidth
+    const naturalHeight = el.scrollHeight
+    if (!naturalWidth || !naturalHeight) return
+    const scale = dimensions.width / naturalWidth
+    setFillWidthMetrics({ scale, height: naturalHeight * scale })
+  }, [
+    textFit,
+    dimensions.width,
+    text,
+    fontSize,
+    letterSpacing,
+    lineHeight,
+    fontFamily,
+    fontWeight,
+    fontStyle,
+  ])
 
   const staticTouchFill = touchBehavior === "static" && isTouchDevice
 
@@ -329,6 +365,11 @@ export default function TraceReveal(props: TraceRevealProps) {
   const innerStopPercent = clamp01(edgeHardness) * 95
   const maskImage = useMotionTemplate`radial-gradient(circle ${radius}px at ${springX}px ${springY}px, black 0%, black ${innerStopPercent}%, transparent 100%)`
 
+  const isFillWidth = textFit === "fill-width"
+
+  // In Fill Width mode both layers get the identical transform (same scale, same
+  // origin) so they stay pixel-aligned; inline-block makes scrollWidth reflect the
+  // text's natural shrink-to-fit size rather than the wrapper's own 100% width.
   const sharedTextStyle: CSSProperties = {
     margin: 0,
     fontFamily,
@@ -338,8 +379,15 @@ export default function TraceReveal(props: TraceRevealProps) {
     letterSpacing: `${letterSpacing}px`,
     lineHeight: `${lineHeight}`,
     textAlign,
-    whiteSpace: "pre-wrap",
+    whiteSpace: isFillWidth ? "nowrap" : "pre-wrap",
     overflowWrap: "break-word",
+    ...(isFillWidth
+      ? {
+          display: "inline-block",
+          transform: `scale(${fillWidthMetrics.scale})`,
+          transformOrigin: "top left",
+        }
+      : {}),
   }
 
   const baseTextStyle: CSSProperties = {
@@ -363,10 +411,17 @@ export default function TraceReveal(props: TraceRevealProps) {
             : {}),
         }
 
+  // Explicit height in Fill Width mode: `transform: scale()` never affects layout, so
+  // without this the wrapper's auto-height would reflect the natural, unscaled text —
+  // too small (or large) once actually rendered, causing it to bleed into neighboring
+  // canvas content. Wrap mode is untouched (no height override, same as before).
   const rootStyle: CSSProperties = {
     position: "relative",
     display: "block",
     width: "100%",
+    ...(isFillWidth && fillWidthMetrics.height > 0
+      ? { height: `${fillWidthMetrics.height}px` }
+      : {}),
     ...props.style,
   }
 
@@ -386,7 +441,7 @@ export default function TraceReveal(props: TraceRevealProps) {
   return (
     <div ref={containerRef} style={rootStyle}>
       {/* Real, selectable, screen-reader-readable text node. */}
-      <div style={baseTextStyle}>{text}</div>
+      <div ref={baseTextRef} style={baseTextStyle}>{text}</div>
 
       {/* Decorative fill layer, clipped to the reveal circle. Never part of the a11y tree. */}
       <motion.div
@@ -467,6 +522,13 @@ addPropertyControls(TraceReveal, {
         options: ["left", "center", "right"],
         optionTitles: ["Left", "Center", "Right"],
         displaySegmentedControl: true,
+      },
+      textFit: {
+        type: ControlType.Enum,
+        title: "Text Fit",
+        defaultValue: "wrap",
+        options: ["wrap", "fill-width"],
+        optionTitles: ["Wrap (Fixed Size)", "Fill Width (Single Line)"],
       },
     },
   },
