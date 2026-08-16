@@ -60,6 +60,7 @@ interface RevealGroup {
 interface InteractionGroup {
   touchBehavior: TouchBehavior
   idleAnimation: boolean
+  padding: string
 }
 
 interface TraceRevealProps {
@@ -73,6 +74,17 @@ interface TraceRevealProps {
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value))
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t
+
+// Expands a CSS padding shorthand string ("10px" / "10px 20px" / ... / "10px 20px 30px 40px")
+// into per-side px numbers, following standard CSS shorthand expansion rules.
+const parsePadding = (value: string) => {
+  const parts = value
+    .trim()
+    .split(/\s+/)
+    .map((part) => parseFloat(part) || 0)
+  const [top = 0, right = top, bottom = top, left = right] = parts
+  return { top, right, bottom, left }
+}
 
 const IDLE_DELAY_MS = 3000
 
@@ -126,11 +138,21 @@ export default function TraceReveal(props: TraceRevealProps) {
     followDelay = 0.3,
   } = reveal
 
-  const { touchBehavior = "drag", idleAnimation = false } = interaction
+  const {
+    touchBehavior = "drag",
+    idleAnimation = false,
+    padding = "80px 40px 80px 40px",
+  } = interaction
+
+  // The hit area is expanded beyond the text by this much on each side via a separate
+  // absolutely-positioned overlay (see hitAreaStyle below) — never via padding/margin on
+  // the text's own box, so the text's layout, size, and position stay exactly as-is.
+  const hitAreaPadding = useMemo(() => parsePadding(padding), [padding])
 
   const isCanvas = RenderTarget.current() === RenderTarget.canvas
 
   const containerRef = useRef<HTMLDivElement>(null)
+  const hitAreaRef = useRef<HTMLDivElement>(null)
   const isInView = useInView(containerRef, { amount: 0.4, once: false })
 
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
@@ -189,14 +211,17 @@ export default function TraceReveal(props: TraceRevealProps) {
 
   const staticTouchFill = touchBehavior === "static" && isTouchDevice
 
-  // Pointer tracking is scoped to this component's own bounding box (not window)
-  // so multiple instances on a page never steal each other's input.
+  // Pointer listeners live on the expanded hit-area overlay (not window, so multiple
+  // instances on a page never steal each other's input), but coordinates are measured
+  // against the text's own (unpadded) box, since that's the coordinate space the mask
+  // and text layers actually render in.
   useEffect(() => {
-    const el = containerRef.current
-    if (!el || staticTouchFill) return
+    const hitEl = hitAreaRef.current
+    const textEl = containerRef.current
+    if (!hitEl || !textEl || staticTouchFill) return
 
     const updateFromPoint = (clientX: number, clientY: number) => {
-      const rect = el.getBoundingClientRect()
+      const rect = textEl.getBoundingClientRect()
       hasInteractedRef.current = true
       rawX.set(clientX - rect.left)
       rawY.set(clientY - rect.top)
@@ -212,15 +237,15 @@ export default function TraceReveal(props: TraceRevealProps) {
       setIsRevealActive(true)
     }
 
-    el.addEventListener("pointermove", handlePointerMove)
-    el.addEventListener("pointerdown", handlePointerDown)
-    el.addEventListener("pointerleave", handlePointerLeave)
-    el.addEventListener("pointercancel", handlePointerLeave)
+    hitEl.addEventListener("pointermove", handlePointerMove)
+    hitEl.addEventListener("pointerdown", handlePointerDown)
+    hitEl.addEventListener("pointerleave", handlePointerLeave)
+    hitEl.addEventListener("pointercancel", handlePointerLeave)
     return () => {
-      el.removeEventListener("pointermove", handlePointerMove)
-      el.removeEventListener("pointerdown", handlePointerDown)
-      el.removeEventListener("pointerleave", handlePointerLeave)
-      el.removeEventListener("pointercancel", handlePointerLeave)
+      hitEl.removeEventListener("pointermove", handlePointerMove)
+      hitEl.removeEventListener("pointerdown", handlePointerDown)
+      hitEl.removeEventListener("pointerleave", handlePointerLeave)
+      hitEl.removeEventListener("pointercancel", handlePointerLeave)
     }
   }, [rawX, rawY, staticTouchFill])
 
@@ -257,7 +282,7 @@ export default function TraceReveal(props: TraceRevealProps) {
       scheduleIdle()
     }
 
-    const el = containerRef.current
+    const el = hitAreaRef.current
     el?.addEventListener("pointermove", handleActivity)
     el?.addEventListener("pointerdown", handleActivity)
     scheduleIdle()
@@ -342,8 +367,20 @@ export default function TraceReveal(props: TraceRevealProps) {
     position: "relative",
     display: "block",
     width: "100%",
-    touchAction: touchBehavior === "drag" ? "none" : "auto",
     ...props.style,
+  }
+
+  // Absolutely-positioned overlay, offset outward by the padding amounts. It doesn't
+  // contribute to rootStyle's own auto-sized box (absolute elements are out of flow),
+  // so the text's layout/size/position stay exactly as if padding were 0. Painted last
+  // so it sits above the text layers and can capture pointer events across its full area.
+  const hitAreaStyle: CSSProperties = {
+    position: "absolute",
+    top: -hitAreaPadding.top,
+    left: -hitAreaPadding.left,
+    right: -hitAreaPadding.right,
+    bottom: -hitAreaPadding.bottom,
+    touchAction: touchBehavior === "drag" ? "none" : "auto",
   }
 
   return (
@@ -372,6 +409,9 @@ export default function TraceReveal(props: TraceRevealProps) {
       >
         <div style={fillTextStyle}>{text}</div>
       </motion.div>
+
+      {/* Invisible pointer-tracking overlay, expanded beyond the text by Padding. */}
+      <div ref={hitAreaRef} aria-hidden="true" style={hitAreaStyle} />
     </div>
   )
 }
@@ -558,6 +598,11 @@ addPropertyControls(TraceReveal, {
         type: ControlType.Boolean,
         title: "Idle Animation",
         defaultValue: false,
+      },
+      padding: {
+        type: ControlType.Padding,
+        title: "Padding",
+        defaultValue: "80px 40px 80px 40px",
       },
     },
   },
